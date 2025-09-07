@@ -49,9 +49,9 @@ jobs:
       id-token: write
     uses: ./.github/workflows/requirement_agent.yml
     with:
-      gcp_project_id: tbd
+      gcp_project_id: ${{ inputs.gcp_project_id }}
       gcp_location:   global
-      gcs_bucket:     gs://pdf-agent-x
+      gcs_bucket:     gs://pdf-agents-x
     secrets:
-      GCP_WORKLOAD_IDENTITY_PROVIDER: projects/xxxx/locations/global/workloadIdentityPools/github-actions-pool/providers/github-provider
-      GCP_SERVICE_ACCOUNT_EMAIL:      github-actions-sa@tbd.iam.gserviceaccount.com
+      GCP_WORKLOAD_IDENTITY_PROVIDER: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+      GCP_SERVICE_ACCOUNT_EMAIL:     ${{ secrets.GCP_SERVICE_ACCOUNT_EMAIL }}
