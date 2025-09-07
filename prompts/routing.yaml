@@ -1,0 +1,24 @@
+version: 1
+rules:
+  - when: { comment_any: ["requirement", "user story", "acceptance criteria"] }
+    choose: ["npp_requirements"]
+    weight: 3
+
+  - when: { comment_any: ["NPP", "PayID", "PayTo", "Osko", "RBA", "AP+", "Australian Payments Plus", "ISO 20022"] }
+    choose: ["npp_requirements", "iso20022_mapping"]
+    weight: 4
+
+  - when: { pdf_signals: { contains_tables: true, page_count_min: 10 } }
+    choose: ["table_extraction"]
+    weight: 2
+
+  - when: { comment_any: ["CPS 234", "CPS 230", "privacy", "OAIC", "APP", "AI ethics", "AI safety"] }
+    choose: ["risk_compliance_au"]
+    weight: 3
+
+defaults:
+  fallback: ["npp_requirements"]
+  combo:
+    iso20022_mapping: ["npp_requirements"]
+    table_extraction: ["npp_requirements"]
+    risk_compliance_au: ["npp_requirements"]

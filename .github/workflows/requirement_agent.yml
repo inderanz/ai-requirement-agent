@@ -1,0 +1,592 @@
+name: PDF Issue → Gemini → Markdown (reusable, containerized, SDK)
+
+on:
+  workflow_call:
+    inputs:
+      gcp_project_id:  { required: true, type: string }
+      gcp_location:    { required: true, type: string }         # e.g., australia-southeast1
+      gcs_bucket:      { required: true, type: string }          # e.g., gs://pdf-agent
+
+      # Prompt customisation
+      force_prompt_ids:   { required: false, type: string, default: "" }   # "npp_requirements,iso20022_mapping"
+      prompts_dir:        { required: false, type: string, default: "" }   # ".prompts" in caller repo if provided
+      routing_path:       { required: false, type: string, default: "prompts/routing.yaml" }
+      inline_task_prompt: { required: false, type: string, default: "" }   # multiline ok
+
+    secrets:
+      GCP_WORKLOAD_IDENTITY_PROVIDER: { required: true }
+      GCP_SERVICE_ACCOUNT_EMAIL:      { required: true }
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+  id-token: write
+
+env:
+  OUTPUT_ROOT: docs/issue-reports
+
+jobs:
+  prep:
+    runs-on: ubuntu-latest
+    container: ghcr.io/${{ github.repository_owner }}/ai-pdf-agent:stable
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.event.issue.number }}
+      cancel-in-progress: true
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+      id-token: write
+
+    steps:
+      - name: Checkout caller repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Checkout central prompts/scripts (this same repo), using sparse-checkout
+      - name: Checkout central prompts & scripts
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ github.ref }}
+          path: .agent/defaults
+          sparse-checkout: |
+            prompts
+            scripts
+            requirements.txt
+          sparse-checkout-cone-mode: false
+
+      - name: Determine issue metadata
+        id: meta
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "ISSUE_NUMBER=${{ github.event.issue.number }}" >> $GITHUB_OUTPUT
+          echo "REPO_FULL=${{ github.repository }}" >> $GITHUB_OUTPUT
+          echo "EVENT_NAME=${{ github.event_name }}" >> $GITHUB_OUTPUT
+          echo "DEFAULT_BRANCH=${{ github.event.repository.default_branch }}" >> $GITHUB_OUTPUT
+
+      # Make git trust the workspace BEFORE any gh commands
+      - name: Mark workspace safe for git (early)
+        shell: bash
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git config --global --add safe.directory "$(pwd)"
+
+      - name: Status update start 
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          ISSUE="${{ steps.meta.outputs.ISSUE_NUMBER }}"
+          BODY="$(cat <<EOF
+          🚀 **Processing started**
+
+          • Workflow: ${GITHUB_WORKFLOW}
+          • Run: ${RUN_URL}
+          • Branch: will be \`feature/issue-${ISSUE}\`
+
+          I’ll post updates here as I go.
+          EOF
+          )"
+          gh issue comment "${ISSUE}" --body "$BODY"
+
+      - name: Mark workspace safe for git
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git config --global --add safe.directory "$(pwd)"
+
+      - name: Prepare feature branch
+        id: branch
+        env:
+          ISSUE: ${{ steps.meta.outputs.ISSUE_NUMBER }}
+          BASE: ${{ steps.meta.outputs.DEFAULT_BRANCH }}
+        run: |
+          set -e
+          BRANCH="feature/issue-${ISSUE}"
+          if git ls-remote --exit-code --heads origin "$BRANCH" > /dev/null 2>&1; then
+            git fetch origin "$BRANCH" --quiet
+            git checkout "$BRANCH"
+          else
+            git fetch origin "$BASE" --quiet
+            git checkout -B "$BRANCH" "origin/$BASE"
+          fi
+          echo "BRANCH=$BRANCH" >> $GITHUB_OUTPUT
+
+      - name: Resolve prompts source
+        id: prompts
+        run: |
+          if [ -n "${{ inputs.prompts_dir }}" ] && [ -d "${{ inputs.prompts_dir }}" ]; then
+            echo "PROMPTS_DIR=${{ inputs.prompts_dir }}" >> $GITHUB_OUTPUT
+            echo "ROUTING_PATH=${{ inputs.routing_path }}" >> $GITHUB_OUTPUT
+          else
+            echo "PROMPTS_DIR=.agent/defaults/prompts" >> $GITHUB_OUTPUT
+            # routing path is relative to PROMPTS_DIR
+            echo "ROUTING_PATH=routing.yaml" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Determine extract mode from labels
+        id: extract
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          LABELS=$(gh issue view ${{ steps.meta.outputs.ISSUE_NUMBER }} --json labels -q '.labels[].name' | tr '\n' ' ')
+          MODE=selective
+          if echo "$LABELS" | grep -qi 'full-extract'; then MODE=full; fi
+          echo "MODE=$MODE" >> $GITHUB_OUTPUT
+
+      - name: Collect issue context & find PDFs
+        id: context
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python .agent/defaults/scripts/collect_issue_context.py \
+            --repo "${{ steps.meta.outputs.REPO_FULL }}" \
+            --issue "${{ steps.meta.outputs.ISSUE_NUMBER }}" \
+            --event "${{ github.event_name }}" \
+            --out-json issue_context.json
+
+      - name: Detect repo-staged PDF paths in issue body and inject into context
+        id: inject_repo_pdfs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          BODY="$(
+            jq -r '
+              if has("issue") and .issue.body then .issue.body
+              elif has("comment") and .comment.body then .comment.body
+              else ""
+              end
+            ' "$GITHUB_EVENT_PATH"
+          )"
+          MATCHES=$(printf "%s" "$BODY" | grep -Eoi 'upload-pdf/[^ )\]\}\n\r]+\.pdf([?#][^ )\]\}\n\r]+)?' || true)
+
+          ADD=()
+          while IFS= read -r m; do
+            m="${m%%]*}"; m="${m%%)*}"; m="${m%%.}"
+            p="${m#./}"
+            if [ -f "$p" ]; then
+              ADD+=("$p")
+            fi
+          done <<< "$MATCHES"
+
+          if [ ${#ADD[@]} -gt 0 ]; then
+            jq -c 'if (.pdf_urls|type!="array") then .pdf_urls=[] else . end' issue_context.json > issue_context.json.tmp && mv issue_context.json.tmp issue_context.json
+            for f in "${ADD[@]}"; do
+              jq --arg p "$f" '.pdf_urls += [$p]' issue_context.json > issue_context.json.tmp && mv issue_context.json.tmp issue_context.json
+            done
+            echo "Injected ${#ADD[@]} repo PDF(s) into issue_context.json."
+          else
+            echo "No valid upload-pdf/*.pdf paths found in issue text."
+          fi
+
+      # - name: Comment detected inputs
+      #   env:
+      #     GH_TOKEN: ${{ github.token }}
+      #   shell: bash
+      #   run: |
+      #     set -euo pipefail
+      #     ISSUE="${{ steps.meta.outputs.ISSUE_NUMBER }}"
+      #     LIST="$(jq -r '.pdf_urls[]?' issue_context.json | sed 's/^/* /' || true)"
+
+      #     if [ -z "$LIST" ]; then
+      #        # No variable expansion needed here → quote EOF
+      #        cat > .gh-comment.md <<'EOF'
+      #           **Inputs detected**
+
+      #           _No PDF references found._
+
+      #           Please include a repo path like `upload-pdf/example.pdf` in the issue body.
+      #        EOF
+      #     else
+      #       # We want $LIST to expand → do NOT quote EOF
+      #       cat > .gh-comment.md <<EOF
+      #         🔎 **Inputs detected**
+
+      #         $LIST
+      #       EOF
+      #     fi
+
+      #       gh issue comment "${ISSUE}" --body-file .gh-comment.md
+
+
+      - name: Fetch PDFs, OCR if needed, selective image extraction, chunk if needed
+        id: prep_pdfs
+        env:
+          OUTPUT_ROOT: ${{ env.OUTPUT_ROOT }}
+          GCS_BUCKET: ${{ inputs.gcs_bucket }}
+          EXTRACT_MODE: ${{ steps.extract.outputs.MODE }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python .agent/defaults/scripts/fetch_and_prepare_pdf.py \
+            --context issue_context.json \
+            --output-root "$OUTPUT_ROOT"
+          echo "ARTIFACT_DIR=$(jq -r '.artifact_dir' issue_context.json)" >> "$GITHUB_OUTPUT"
+          echo "GCS_URIS=$(jq -r '.gcs_uris | join(",")' issue_context.json)" >> "$GITHUB_OUTPUT"
+          echo "MODEL=$(jq -r '.policy.model' issue_context.json)" >> "$GITHUB_OUTPUT"
+          echo "CHUNKED=$(jq -r '.policy.chunked' issue_context.json)" >> "$GITHUB_OUTPUT"
+
+      - name: Log policy
+        run: |
+          echo "Model chosen: ${{ steps.prep_pdfs.outputs.MODEL }}"
+          echo "Chunked: ${{ steps.prep_pdfs.outputs.CHUNKED }}"
+
+      - name: Authenticate to Google Cloud (WIF)
+        uses: google-github-actions/auth@v2
+        with:
+          project_id: ${{ inputs.gcp_project_id }}
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT_EMAIL }}
+          create_credentials_file: true
+          export_environment_variables: true
+
+      - name: Setup gcloud
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Upload (OCR’d) PDFs to GCS
+        run: |
+          jq -r '.final_pdf_paths[]' issue_context.json | while read f; do
+            base="$(basename "$f")"
+            dst="${{ inputs.gcs_bucket }}/issues/${{ steps.meta.outputs.ISSUE_NUMBER }}/$base"
+            echo "Uploading $f -> $dst"
+            gcloud storage cp "$f" "$dst" --quiet
+          done
+
+      # - name: Comment upload destinations
+      #   env:
+      #   GH_TOKEN: ${{ github.token }}
+      #   shell: bash
+      #   run: |
+      #     set -euo pipefail
+      #     ISSUE="${{ steps.meta.outputs.ISSUE_NUMBER }}"
+      #     BUCKET="${{ inputs.gcs_bucket }}"
+
+      #     # Build the bullet list from final_pdf_paths
+      #     LIST="$(jq -r '.final_pdf_paths[]?' issue_context.json | while read -r f; do
+      #        base="$(basename "$f")"
+      #        echo "* ${BUCKET}/issues/${ISSUE}/${base}"
+      #     done)"
+
+      #     # Write the comment body to a file (no heredoc indentation!)
+      #     if [ -z "$LIST" ]; then
+      #        cat > .gh-comment.md <<'EOF'
+      #          ☁️ **Uploaded to Cloud Storage**
+
+      #     (none)
+      #      EOF
+      #     else
+      #     cat > .gh-comment.md <<EOF
+      #     ☁️ **Uploaded to Cloud Storage**
+
+      #     $LIST
+      #     EOF
+      #     fi
+
+      #     gh issue comment "${ISSUE}" --body-file .gh-comment.md
+
+
+      - name: Build system + user prompt
+        id: prompt
+        env:
+          MODEL: ${{ steps.prep_pdfs.outputs.MODEL }}
+          GCP_LOCATION: ${{ inputs.gcp_location }}
+          GCP_PROJECT_ID: ${{ inputs.gcp_project_id }}
+          PROMPTS_DIR: ${{ steps.prompts.outputs.PROMPTS_DIR }}
+        run: |
+          python .agent/defaults/scripts/build_prompt.py \
+            --context issue_context.json \
+            --model "$MODEL" \
+            --out prompt.txt \
+            --settings .gemini/settings.json
+
+      - name: Run Gemini with Vertex AI SDK (native gs:// PDFs)
+        id: gemini
+        env:
+          GCP_PROJECT_ID: ${{ inputs.gcp_project_id }}
+          GCP_LOCATION:   ${{ inputs.gcp_location }}
+        run: |
+          python .agent/defaults/scripts/run_gemini_sdk.py \
+            --context issue_context.json \
+            --model   "${{ steps.prep_pdfs.outputs.MODEL }}" \
+            --prompt-file prompt.txt \
+            --project "${GCP_PROJECT_ID}" \
+            --location "${GCP_LOCATION}" \
+            --out summary.txt \
+            --dump-response ".agent/debug/raw_response.json" \
+            --debug
+
+      - name: Comment model completion
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          gh issue comment ${{ steps.meta.outputs.ISSUE_NUMBER }} --body "$(cat <<'EOF'
+          🧠 **Gemini run complete.** Generating the Markdown report…
+          EOF
+          )"
+
+      - name: Upload Gemini debug
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gemini-debug
+          path: .debug-gemini
+          if-no-files-found: ignore
+
+      - name: Upload Gemini output (summary)
+        uses: actions/upload-artifact@v4
+        with:
+          name: gemini-output
+          path: summary.txt
+          if-no-files-found: error
+
+      - name: Upload prep context (for finalize)
+        uses: actions/upload-artifact@v4
+        with:
+          name: prep-context
+          path: |
+            issue_context.json
+            prompt_selection.json
+          if-no-files-found: error
+
+      - name: Upload report assets (images) for finalize
+        uses: actions/upload-artifact@v4
+        with:
+          name: report-assets
+          path: |
+            ${{ env.OUTPUT_ROOT }}/issue-${{ steps.meta.outputs.ISSUE_NUMBER }}/images
+          if-no-files-found: ignore
+
+      - name: Failure comment (prep)
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          gh issue comment ${{ steps.meta.outputs.ISSUE_NUMBER }} --body "$(cat <<EOF
+          ❌ **Run failed during preparation.**
+
+          Please see [workflow logs](${RUN_URL}).
+          EOF
+          )"
+
+  finalize:
+    runs-on: ubuntu-latest
+    container: ghcr.io/${{ github.repository_owner }}/ai-pdf-agent:stable
+    needs: prep
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+      id-token: write
+    env:
+      OUTPUT_ROOT: docs/issue-reports
+
+    steps:
+      - name: Checkout caller repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Checkout validator script
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ github.ref }}
+          path: .agent/defaults
+          sparse-checkout: |
+            scripts/validate_and_fix_md.py
+          sparse-checkout-cone-mode: false
+
+
+      - name: Determine issue metadata
+        id: meta
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "ISSUE_NUMBER=${{ github.event.issue.number }}" >> $GITHUB_OUTPUT
+          echo "REPO_FULL=${{ github.repository }}" >> $GITHUB_OUTPUT
+          echo "EVENT_NAME=${{ github.event_name }}" >> $GITHUB_OUTPUT
+          echo "DEFAULT_BRANCH=${{ github.event.repository.default_branch }}" >> $GITHUB_OUTPUT
+
+      - name: Mark workspace safe for git
+        shell: bash
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git config --global --add safe.directory "$(pwd)"
+
+      - name: Prepare feature branch
+        id: branch
+        env:
+          ISSUE: ${{ steps.meta.outputs.ISSUE_NUMBER }}
+          BASE: ${{ steps.meta.outputs.DEFAULT_BRANCH }}
+        run: |
+          set -e
+          BRANCH="feature/issue-${ISSUE}"
+          if git ls-remote --exit-code --heads origin "$BRANCH" > /dev/null 2>&1; then
+            git fetch origin "$BRANCH" --quiet
+            git checkout "$BRANCH"
+          else
+            git fetch origin "$BASE" --quiet
+            git checkout -B "$BRANCH" "origin/$BASE"
+          fi
+          echo "BRANCH=$BRANCH" >> $GITHUB_OUTPUT
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: gemini-output
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: report-assets
+        continue-on-error: true
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: prep-context
+
+      - name: Write/update Markdown report
+        id: write
+        env:
+          ISSUE: ${{ steps.meta.outputs.ISSUE_NUMBER }}
+          OUTPUT_ROOT: ${{ env.OUTPUT_ROOT }}
+        run: |
+          ISSUE_DIR="$OUTPUT_ROOT/issue-${ISSUE}"
+          mkdir -p "$ISSUE_DIR"
+          cat summary.txt > "${ISSUE_DIR}/report.md"
+          echo "REPORT_PATH=${ISSUE_DIR}/report.md" >> $GITHUB_OUTPUT
+
+      - name: Gather images into issue folder
+        env:
+          ISSUE: ${{ steps.meta.outputs.ISSUE_NUMBER }}
+          OUTPUT_ROOT: ${{ env.OUTPUT_ROOT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          ISSUE_DIR="$OUTPUT_ROOT/issue-${ISSUE}"
+          IMG_DIR="${ISSUE_DIR}/images"
+          mkdir -p "$IMG_DIR"
+          for f in page-*-img-*.png *.png; do
+            [ -e "$f" ] || continue
+            case "$f" in
+              *.png|*.jpg|*.jpeg|*.gif|*.svg) mv "$f" "$IMG_DIR/" || true ;;
+            esac
+          done
+
+      - name: Validate generated Markdown (reflection gate)
+        continue-on-error: true
+        run: |
+          if [ -f ".agent/defaults/scripts/validate_and_fix_md.py" ]; then
+            python .agent/defaults/scripts/validate_and_fix_md.py "${{ steps.write.outputs.REPORT_PATH }}" || true
+          else
+            echo "Validator not found; skipping."
+          fi
+
+      - name: Write run manifest
+        run: |
+          jq -n \
+            --arg issue "${{ steps.meta.outputs.ISSUE_NUMBER }}" \
+            --arg model "${{ needs.prep.outputs.MODEL }}" \
+            --arg chunked "${{ needs.prep.outputs.CHUNKED }}" \
+            --argjson selection "$(cat prompt_selection.json)" \
+            '{issue: $issue, model: $model, chunked: $chunked, selection: $selection}' \
+          > "${{ env.OUTPUT_ROOT }}/issue-${{ steps.meta.outputs.ISSUE_NUMBER }}/run_meta.json" || true
+
+      - name: Capture previous HEAD (if any)
+        id: prevsha
+        run: |
+          set -euo pipefail
+          PREV_SHA="$(git rev-parse --verify HEAD 2>/dev/null || true)"
+          echo "prev_sha=$PREV_SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Commit and push report to feature branch
+        env:
+          BRANCH: ${{ steps.branch.outputs.BRANCH }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Make sure we are on the right branch
+          git checkout "$BRANCH"
+
+          # Auth for pushing
+          git remote set-url origin "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git"
+
+          # Identity
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Stage generated files (ignore if they don't exist)
+          git add "${{ steps.write.outputs.REPORT_PATH }}" \
+                  "${{ env.OUTPUT_ROOT }}/issue-${{ steps.meta.outputs.ISSUE_NUMBER }}/images" \
+                  "${{ env.OUTPUT_ROOT }}/issue-${{ steps.meta.outputs.ISSUE_NUMBER }}/run_meta.json" || true
+
+          # Commit even when there are no changes so the branch is published
+          if git diff --cached --quiet; then
+            git commit --allow-empty -m "chore: init branch for issue #${{ steps.meta.outputs.ISSUE_NUMBER }}"
+          else
+            git commit -m "docs: update report for issue #${{ steps.meta.outputs.ISSUE_NUMBER }}"
+          fi
+
+          # Push and set upstream (first time) or update (subsequent runs)
+          git push -u origin "$BRANCH"
+
+          # Sanity check: ensure remote branch exists
+          git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null || {
+            echo "::error::Remote branch not found after push"
+            exit 1
+          }
+
+
+      - name: Comment with report link, commit, and PR starter link
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          ISSUE="${{ steps.meta.outputs.ISSUE_NUMBER }}"
+          REPORT_URL="https://github.com/${{ github.repository }}/blob/${{ steps.branch.outputs.BRANCH }}/${{ steps.write.outputs.REPORT_PATH }}"
+          OPEN_PR_URL="https://github.com/${{ github.repository }}/compare/${{ steps.meta.outputs.DEFAULT_BRANCH }}...${{ steps.branch.outputs.BRANCH }}?expand=1"
+          NEW_SHA="$(git rev-parse HEAD)"
+          SHORT_NEW="$(git rev-parse --short HEAD)"
+          PREV_SHA="${{ steps.prevsha.outputs.prev_sha }}"
+          RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          BRANCH="${{ steps.branch.outputs.BRANCH }}"
+
+          : > .gh-comment.md
+          printf "✅ Report updated\n\n" >> .gh-comment.md
+          printf "• Report: %s\n" "$REPORT_URL" >> .gh-comment.md
+          printf "• Commit: \`%s\`\n" "$SHORT_NEW" >> .gh-comment.md
+          printf "• Branch: \`%s\`\n" "$BRANCH" >> .gh-comment.md
+          printf "• Run: %s\n" "$RUN_URL" >> .gh-comment.md
+
+          if [ -n "$PREV_SHA" ] && [ "$PREV_SHA" != "$NEW_SHA" ]; then
+             DIFF_URL="https://github.com/${{ github.repository }}/compare/${PREV_SHA}...${NEW_SHA}"
+             printf "• Compare: %s\n" "$DIFF_URL" >> .gh-comment.md
+          fi
+
+          printf "\nOpen a PR: %s\n" "$OPEN_PR_URL" >> .gh-comment.md
+
+          gh issue comment "$ISSUE" --body-file .gh-comment.md
+
+
+
+      - name: Failure comment (finalize)
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          gh issue comment ${{ steps.meta.outputs.ISSUE_NUMBER }} --body "$(cat <<EOF
+          ❌ **Run failed during finalize.**
+
+          Please see [workflow logs](${RUN_URL}).
+          EOF
+          )"

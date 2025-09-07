@@ -1,0 +1,57 @@
+name: AI PDF Agent Dispatcher
+
+on:
+  issues:
+    types: [opened, edited]
+  issue_comment:
+    types: [created, edited]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+  id-token: write
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    outputs:
+      should_run: ${{ steps.gate.outputs.should_run }}
+    steps:
+      - name: Decide if we should run (PDF path or @gemini)
+        id: gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          BODY="$(
+            jq -r '
+             if has("issue") and .issue.body then .issue.body
+             elif has("comment") and .comment.body then .comment.body
+             else ""
+             end
+            ' "$GITHUB_EVENT_PATH"
+          )"
+          SHOULD_RUN=false
+          UPLOAD_RE='(^|[[:space:]\(\[\{>])upload-pdf/[^ )\]\}\n\r]+\.pdf([?#][^ )\]\}\n\r]+)?(\)|\]|\}|[[:space:]]|$)'
+          if grep -qi '@gemini' <<<"$BODY"; then SHOULD_RUN=true; fi
+          if grep -Eqi "$UPLOAD_RE" <<<"$BODY"; then SHOULD_RUN=true; fi
+          : "${GITHUB_OUTPUT:=/dev/stdout}"
+          echo "should_run=$SHOULD_RUN" >> "$GITHUB_OUTPUT"
+
+  call-agent:
+    needs: gate
+    if: needs.gate.outputs.should_run == 'true'
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      id-token: write
+    uses: ./.github/workflows/requirement_agent.yml
+    with:
+      gcp_project_id: tbd
+      gcp_location:   global
+      gcs_bucket:     gs://pdf-agent-x
+    secrets:
+      GCP_WORKLOAD_IDENTITY_PROVIDER: projects/xxxx/locations/global/workloadIdentityPools/github-actions-pool/providers/github-provider
+      GCP_SERVICE_ACCOUNT_EMAIL:      github-actions-sa@tbd.iam.gserviceaccount.com

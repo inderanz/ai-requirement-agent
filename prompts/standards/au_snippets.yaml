@@ -1,0 +1,33 @@
+- id: CPS234-6
+  title: Information Security Capability
+  source: https://www.apra.gov.au/news-and-publications/cps-234
+  text: >
+    An APRA-regulated entity must maintain information security capability commensurate with its
+    size and the extent of threats to its information assets.
+
+- id: CPS230-36
+  title: Business Continuity
+  source: https://www.apra.gov.au/news-and-publications/cps-230
+  text: >
+    Entities must maintain business continuity plans for critical operations with defined tolerance
+    for disruption, regular testing, and governance.
+
+- id: APP-6
+  title: Use or Disclosure of Personal Information
+  source: https://oaic.gov.au/privacy/guidance-and-advice/app-6-use-or-disclosure-of-personal-information
+  text: >
+    Personal information must not be used or disclosed for a secondary purpose unless an exception applies.
+
+- id: APP-11
+  title: Security of Personal Information
+  source: https://oaic.gov.au/privacy/guidance-and-advice/app-11-security-of-personal-information
+  text: >
+    Entities must take reasonable steps to protect personal information from misuse, interference, loss,
+    and unauthorised access, modification, or disclosure.
+
+- id: AU-AI-ETHICS
+  title: Australia AI Ethics Principles (summary)
+  source: https://industry.gov.au/publications/australias-artificial-intelligence-ethics-framework
+  text: >
+    Emphasise human, social, and environmental wellbeing; human-centred values; fairness; privacy protection
+    and security; reliability and safety; transparency and explainability; contestability; accountability.

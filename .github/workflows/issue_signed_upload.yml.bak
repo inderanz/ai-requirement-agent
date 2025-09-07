@@ -1,0 +1,86 @@
+name: Signed Upload URL (GCS, WIF)
+
+on:
+  issues:
+    types: [opened]
+
+permissions:
+  issues: write
+  id-token: write
+  contents: read
+
+env:
+  # Fill with your real values
+  GCP_PROJECT_ID: extreme-gecko-466211-t1
+  GCS_BUCKET_NAME: pdf-agent-x           # bucket name only, no gs://
+  URL_EXPIRY_MINUTES: "120"
+
+jobs:
+  make-url:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Auth to Google Cloud (Workload Identity)
+        uses: google-github-actions/auth@v2
+        with:
+          project_id: ${{ env.GCP_PROJECT_ID }}
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT_EMAIL }}
+
+      - name: Setup gcloud
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          version: latest
+
+
+      - name: Compute object key
+        id: obj
+        shell: bash
+        run: |
+          UUID="$(python -c 'import uuid; print(uuid.uuid4())')"
+          echo "object=issues/${{ github.event.issue.number }}/${UUID}.pdf" >> "$GITHUB_OUTPUT"
+
+      - name: Generate V4 PUT signed URL (Content-Type=application/pdf)
+        id: sign
+        shell: bash
+        run: |
+          set -euo pipefail
+          URL="$(gcloud storage sign-url \
+            "gs://${{ env.GCS_BUCKET_NAME }}/${{ steps.obj.outputs.object }}" \
+            --impersonate-service-account='${{ secrets.GCP_SERVICE_ACCOUNT_EMAIL }}' \
+            --http-verb=PUT \
+            --duration='${{ env.URL_EXPIRY_MINUTES }}m' \
+            --headers=content-type=application/pdf)"
+            echo "url=$URL" >> "$GITHUB_OUTPUT"
+
+      - name: Comment upload instructions
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          GCS_URI="gs://${{ env.GCS_BUCKET_NAME }}/${{ steps.obj.outputs.object }}"
+          {
+            echo "🔐 **Secure PDF upload**"
+            echo
+            echo "Use the pre-signed link below to upload your PDF. The link is time-limited and only accepts \`application/pdf\`."
+            echo
+            echo "**Upload (click or use curl):**"
+            echo "- Link: ${{ steps.sign.outputs.url }}"
+            echo
+            echo "**curl example (requires Content-Type):**"
+            echo '```bash'
+            echo "curl -X PUT \\"
+            echo '  -H "Content-Type: application/pdf" \'
+            echo "  --upload-file ./your.pdf \\"
+            echo "  \"${{ steps.sign.outputs.url }}\""
+            echo '```'
+            echo
+            echo "**Target path:** \`$GCS_URI\`"
+            echo
+            echo "When you’re done, reply with **Uploaded** (exact word) or paste the \`gs://...\` path."
+          } > body.txt
+
+          gh api repos/${{ github.repository }}/issues/${{ github.event.issue.number }}/comments \
+            -f body="$(cat body.txt)"
